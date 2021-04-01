@@ -415,7 +415,7 @@ static GstElement *create_pipeline(const char *url, int audio_port, int video_po
     "udpsrc address=localhost port=%d caps=\"application/x-rtp, media=audio, encoding-name=OPUS, clock-rate=48000\" ! rtpbin.recv_rtp_sink_1 "
     "udpsrc address=localhost port=%d caps=\"application/x-rtp, media=video, encoding-name=H264, clock-rate=90000\" ! rtpbin.recv_rtp_sink_0 "
     "rtpbin. ! rtph264depay ! flvmux streamable=true name=mux ! rtmpsink location=\"%s\" "
-    "rtpbin. ! rtpopusdepay ! queue ! opusdec ! voaacenc bitrate=128000 ! mux.",
+    "rtpbin. ! rtpopusdepay ! queue ! opusdec ! audioconvert ! audioresample ! voaacenc bitrate=128000 ! aacparse ! mux.",
     audio_port, video_port, url);
   JANUS_LOG(LOG_INFO, "Pipeline definition: %s\n", pipeline_def);
 
