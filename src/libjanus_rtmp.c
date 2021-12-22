@@ -21,6 +21,7 @@
 #include "janus/plugin.h"
 #include "janus/record.h"
 #include "janus/utils.h"
+#include "janus/config.h"
 
 #include <errno.h>
 #include <gst/gst.h>
@@ -32,6 +33,9 @@
 #define PLUGIN_RTMP_NAME            "Janus RTMP plugin"
 #define PLUGIN_RTMP_AUTHOR          "agureiev@shakuro.com"
 #define PLUGIN_RTMP_PACKAGE         "janus.plugin.rtmp"
+
+#define RTP_RANGE_MIN_DEFAULT 10000
+#define RTP_RANGE_MAX_DEFAULT 49999
 
 /* Plugin methods */
 janus_plugin *create(void);
@@ -75,7 +79,12 @@ static janus_plugin janus_rtmp_plugin =
   );
 
 static volatile gint initialized = 0, stopping = 0;
-static volatile gint next_port = 11000;
+
+static volatile gint next_port = RTP_RANGE_MIN_DEFAULT;
+static uint16_t rtp_range_min  = RTP_RANGE_MIN_DEFAULT;
+static uint16_t rtp_range_max  = RTP_RANGE_MAX_DEFAULT;
+
+#define RTP_RANGE_SIZE rtp_range_max - rtp_range_min + 1 /* inclusive range */
 
 /* Plugin creator */
 janus_plugin *create(void) {
@@ -100,10 +109,22 @@ typedef struct plugin_rtmp_session {
   GstElement *pipeline;
   GstBus *bus;
 
+  uint16_t audio_port;
+  uint16_t video_port;
+
   janus_mutex mutex;
 } plugin_rtmp_session;
-static GHashTable *sessions;
-static janus_mutex sessions_mutex;
+
+typedef struct plugin_rtmp_port_mapping {
+  plugin_rtmp_session *session;
+
+  uint16_t audio_port;
+  uint16_t video_port;
+} plugin_rtmp_port_mapping;
+
+static GArray      *ports;
+static GHashTable  *sessions;
+static janus_mutex sessions_mutex = JANUS_MUTEX_INITIALIZER;
 
 
 /* Error codes */
@@ -119,6 +140,9 @@ static gboolean bus_callback(GstBus * bus, GstMessage * message, gpointer data);
 static plugin_rtmp_session *session_from_handle(janus_plugin_session *handle);
 static gboolean is_valid_url(const char *url);
 static GstElement *start_pipeline(const char* url, int audio_port, int video_port);
+static uint16_t get_free_port(void);
+static void set_port_mapping(plugin_rtmp_session *session, uint16_t aport, uint16_t vport);
+static void clear_port_mapping(plugin_rtmp_session *session);
 
 /* Message handlers. */
 static janus_plugin_result *handle_message(plugin_rtmp_session *session, json_t *root);
@@ -131,13 +155,97 @@ static janus_plugin_result *handle_message_stop(plugin_rtmp_session *session, js
 // ------------------------------------------------------------------------------------------------
 
 int plugin_rtmp_init(janus_callbacks *callback, const char *config_path) {
-  JANUS_LOG(LOG_INFO, "%s initialized!\n", PLUGIN_RTMP_NAME);
-  sessions = g_hash_table_new(NULL, NULL);
-  g_atomic_int_set(&initialized, 1);
+	JANUS_LOG(LOG_INFO, "%s initialized!\n", PLUGIN_RTMP_NAME);
+	sessions = g_hash_table_new(NULL, NULL);
+	if (!sessions) {
+		JANUS_LOG(LOG_ERR, "Failed to allocate sessions table\n");
+		return -1;
+	}
 
-  gst_init(NULL, NULL);
+	ports = g_array_new(FALSE, TRUE, sizeof(plugin_rtmp_port_mapping));
+	if (!ports) {
+		JANUS_LOG(LOG_ERR, "Failed to allocate ports table\n");
+		return -1;
+	}
 
-  return 0;
+	/* Read configuration */
+	if (config_path != NULL) {
+		char filename[BUFSIZ];
+		g_snprintf(filename, BUFSIZ, "%s/%s.jcfg", config_path, PLUGIN_RTMP_PACKAGE);
+		JANUS_LOG(LOG_VERB, "Configuration file: %s\n", filename);
+
+		janus_config *config = janus_config_parse(filename);
+		if (config == NULL) {
+			JANUS_LOG(LOG_WARN, "Couldn't find .jcfg configuration file (%s), trying .cfg\n", PLUGIN_RTMP_PACKAGE);
+			g_snprintf(filename, BUFSIZ, "%s/%s.cfg", config_path, PLUGIN_RTMP_PACKAGE);
+
+			JANUS_LOG(LOG_VERB, "Configuration file: %s\n", filename);
+			config = janus_config_parse(filename);
+		}
+
+		if (config != NULL) {
+			janus_config_print(config);
+
+			janus_config_category *config_general = janus_config_get_create(config, NULL, janus_config_type_category, "general");
+			janus_config_item     *item           = janus_config_get(config, config_general, janus_config_type_item, "rtp_port_range");
+			if (item && item->value) {
+				/* Split in min and max port */
+
+				char *maxport = strrchr(item->value, '-');
+				if (maxport != NULL) {
+					*maxport = '\0';
+					maxport++;
+
+					if (janus_string_to_uint16(item->value, &rtp_range_min) < 0)
+						JANUS_LOG(LOG_WARN, "Invalid RTP min port value: %s (assuming 0)\n", item->value);
+
+					if (janus_string_to_uint16(maxport, &rtp_range_max) < 0)
+						JANUS_LOG(LOG_WARN, "Invalid RTP max port value: %s (assuming 0)\n", maxport);
+
+					maxport--;
+					*maxport = '-';
+				}
+
+				if (rtp_range_min > rtp_range_max) {
+					uint16_t temp_port = rtp_range_min;
+					rtp_range_min = rtp_range_max;
+					rtp_range_max = temp_port;
+				}
+
+				if (rtp_range_max == 0)
+					rtp_range_max = 65535;
+
+				next_port = rtp_range_min;
+
+				if (RTP_RANGE_SIZE) {
+					plugin_rtmp_port_mapping template = {
+						.session = NULL,
+						.audio_port = 0,
+						.video_port = 0
+					};
+
+					uint16_t i = 0;
+					for (;i < RTP_RANGE_SIZE; i++) {
+						g_array_append_val(ports, template);
+					}
+
+					JANUS_LOG(LOG_VERB, "Ports mapping array size: %u\n", ports->len);
+				}
+
+				JANUS_LOG(LOG_VERB, "Gstreamer RTMP port range: %u -- %u\n", rtp_range_min, rtp_range_max);
+			}
+
+			janus_config_destroy(config);
+			config = NULL;
+		}
+	} else {
+		JANUS_LOG(LOG_WARN, "No config_path provided\n");
+	}
+
+	g_atomic_int_set(&initialized, 1);
+	gst_init(NULL, NULL);
+
+	return 0;
 }
 
 void plugin_rtmp_destroy(void) {
@@ -234,9 +342,6 @@ json_t *plugin_rtmp_query_session(janus_plugin_session *handle) {
   return result;
 }
 
-
-
-
 struct janus_plugin_result *plugin_rtmp_handle_message(janus_plugin_session *handle, char *transaction, json_t *message, json_t *jsep) {
   janus_plugin_result *result;
 
@@ -315,6 +420,9 @@ static janus_plugin_result *handle_message(plugin_rtmp_session *session, json_t 
 static janus_plugin_result *handle_message_start(plugin_rtmp_session *session, json_t* root) {
   JANUS_LOG(LOG_INFO, "[%s] Handling start\n", PLUGIN_RTMP_PACKAGE);
 
+  uint16_t audio_port = 0;
+  uint16_t video_port = 0;
+
   json_t *value = json_object_get(root, "url");
   const char *url = json_string_value(value);
 
@@ -322,10 +430,22 @@ static janus_plugin_result *handle_message_start(plugin_rtmp_session *session, j
     return janus_plugin_result_new(JANUS_PLUGIN_ERROR, "Invalid URL format", NULL);
   }
 
-  // generate ports
   janus_mutex_lock(&session->mutex);
-  int audio_port = next_port++;
-  int video_port = next_port++;
+
+  audio_port = get_free_port();
+  video_port = get_free_port();
+
+  if (audio_port && video_port) {
+    JANUS_LOG(LOG_INFO, "[%s] Session %p got aport: %u, vport: %u\n", PLUGIN_RTMP_PACKAGE, session, audio_port, video_port);
+
+    set_port_mapping(session, audio_port, video_port);
+    session->audio_port = audio_port;
+    session->video_port = video_port;
+  } else {
+    janus_mutex_lock(&session->mutex);
+    return janus_plugin_result_new(JANUS_PLUGIN_ERROR, "No more ports available", NULL);
+  }
+
   GstElement *pipeline = start_pipeline(url, audio_port, video_port);
 
   // Start watching the pipeline bus for events
@@ -342,8 +462,8 @@ static janus_plugin_result *handle_message_start(plugin_rtmp_session *session, j
 
   json_t *response = json_object();
   json_object_set_new(response, "streaming", json_string("started"));
-  json_object_set_new(response, "audio_port", json_integer(audio_port));
-  json_object_set_new(response, "video_port", json_integer(video_port));
+  json_object_set_new(response, "audio_port", json_integer((int)audio_port));
+  json_object_set_new(response, "video_port", json_integer((int)video_port));
 
   return janus_plugin_result_new(JANUS_PLUGIN_OK, NULL, response);
 }
@@ -380,9 +500,75 @@ static void stop_session_pipeline(plugin_rtmp_session *session) {
     session->bus = NULL;
   }
 
+  clear_port_mapping(session);
+
   janus_mutex_unlock(&session->mutex);
 }
 
+/* use under the session lock */
+static uint16_t get_free_port(void)
+{
+	uint16_t port = 0;
+	uint16_t counter = 0;
+
+	while (counter < RTP_RANGE_SIZE) {
+		plugin_rtmp_port_mapping *map = NULL;
+
+		if (next_port <= rtp_range_max) {
+			port = next_port++;
+		} else {
+			next_port = rtp_range_min;
+			port = next_port++;
+		}
+
+		map = &g_array_index(ports, plugin_rtmp_port_mapping, port - rtp_range_min);
+		if (map && !map->session)
+			return port;
+		if (map && map->session)
+			JANUS_LOG(LOG_HUGE, "[%s] Port %u is used by session %p, skipping\n", PLUGIN_RTMP_PACKAGE, port, map->session );
+
+		counter++;
+	}
+
+	JANUS_LOG(LOG_ERR, "[%s] no free ports found\n", PLUGIN_RTMP_PACKAGE);
+
+	return 0;
+}
+
+/* use under the session lock */
+static void set_port_mapping(plugin_rtmp_session *session, uint16_t aport, uint16_t vport)
+{
+	plugin_rtmp_port_mapping *amap = NULL;
+	plugin_rtmp_port_mapping *vmap = NULL;
+
+	amap = &g_array_index(ports, plugin_rtmp_port_mapping, aport);
+	amap->session    = session;
+	amap->audio_port = aport;
+	amap->video_port = vport;
+
+	vmap = &g_array_index(ports, plugin_rtmp_port_mapping, vport);
+	vmap->session    = session;
+	vmap->audio_port = aport;
+	vmap->video_port = vport;
+}
+
+/* use under the session lock */
+static void clear_port_mapping(plugin_rtmp_session *session)
+{
+	plugin_rtmp_port_mapping *amap = NULL;
+	plugin_rtmp_port_mapping *vmap = NULL;
+
+	if (session)
+	amap = &g_array_index(ports, plugin_rtmp_port_mapping, session->audio_port);
+	amap->session    = NULL;
+	amap->audio_port = 0;
+	amap->video_port = 0;
+
+	vmap = &g_array_index(ports, plugin_rtmp_port_mapping, session->video_port);
+	vmap->session    = NULL;
+	vmap->audio_port = 0;
+	vmap->video_port = 0;
+}
 
 // ------------------------------------------------------------------------------------------------
 // Utility
@@ -417,6 +603,7 @@ static GstElement *create_pipeline(const char *url, int audio_port, int video_po
     "rtpbin. ! rtph264depay ! flvmux streamable=true name=mux ! rtmpsink location=\"%s\" "
     "rtpbin. ! rtpopusdepay ! queue ! opusdec ! audioconvert ! audioresample ! voaacenc bitrate=128000 ! aacparse ! mux.",
     audio_port, video_port, url);
+
   JANUS_LOG(LOG_INFO, "Pipeline definition: %s\n", pipeline_def);
 
   pipeline = gst_parse_launch(pipeline_def, NULL);
