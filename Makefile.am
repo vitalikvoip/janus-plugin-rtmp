@@ -1,5 +1,6 @@
 ACLOCAL_AMFLAGS = -I m4
 CFLAGS = $(shell pkg-config --cflags gstreamer-1.0)
+CFLAGS += -O0 -g3 -ggdb3
 CXXFLAGS = $(CFLAGS)
 lib_LTLIBRARIES = libjanus_rtmp.la
 libjanus_rtmp_la_SOURCES = src/libjanus_rtmp.c
