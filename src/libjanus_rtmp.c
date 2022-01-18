@@ -442,7 +442,7 @@ static janus_plugin_result *handle_message_start(plugin_rtmp_session *session, j
     session->audio_port = audio_port;
     session->video_port = video_port;
   } else {
-    janus_mutex_lock(&session->mutex);
+    janus_mutex_unlock(&session->mutex);
     return janus_plugin_result_new(JANUS_PLUGIN_ERROR, "No more ports available", NULL);
   }
 
