@@ -139,7 +139,7 @@ static void stop_session_pipeline(plugin_rtmp_session *session);
 static gboolean bus_callback(GstBus * bus, GstMessage * message, gpointer data);
 static plugin_rtmp_session *session_from_handle(janus_plugin_session *handle);
 static gboolean is_valid_url(const char *url);
-static GstElement *start_pipeline(const char* url, int audio_port, int video_port);
+static GstElement *start_pipeline(const char* url, int audio_port, int video_port, gboolean dummy_audio);
 static uint16_t get_free_port(void);
 static void set_port_mapping(plugin_rtmp_session *session, uint16_t aport, uint16_t vport);
 static void clear_port_mapping(plugin_rtmp_session *session);
@@ -422,9 +422,22 @@ static janus_plugin_result *handle_message_start(plugin_rtmp_session *session, j
 
   uint16_t audio_port = 0;
   uint16_t video_port = 0;
+  char      url[BUFSIZ] = {0};
+  gboolean  dummy_audio = FALSE;
 
-  json_t *value = json_object_get(root, "url");
-  const char *url = json_string_value(value);
+  json_t *url_value = json_object_get(root, "url");
+  if (json_string_value(url_value)) {
+    snprintf(url, sizeof(url), "%s", json_string_value(url_value));
+  }
+  if (url_value != NULL) {
+    json_decref(url_value);
+  }
+
+  json_t *dummy_audio_value  = json_object_get(root, "dummyAudio");
+  dummy_audio = json_boolean_value(dummy_audio_value);
+  if (dummy_audio_value != NULL) {
+    json_decref(dummy_audio_value);
+  }
 
   if (!is_valid_url(url)) {
     return janus_plugin_result_new(JANUS_PLUGIN_ERROR, "Invalid URL format", NULL);
@@ -446,7 +459,7 @@ static janus_plugin_result *handle_message_start(plugin_rtmp_session *session, j
     return janus_plugin_result_new(JANUS_PLUGIN_ERROR, "No more ports available", NULL);
   }
 
-  GstElement *pipeline = start_pipeline(url, audio_port, video_port);
+  GstElement *pipeline = start_pipeline(url, audio_port, video_port, dummy_audio);
 
   // Start watching the pipeline bus for events
   GstBus *bus = gst_element_get_bus(pipeline);
@@ -454,11 +467,8 @@ static janus_plugin_result *handle_message_start(plugin_rtmp_session *session, j
 
   session->pipeline = pipeline;
   session->bus = bus;
+
   janus_mutex_unlock(&session->mutex);
-
-
-  // This releases the `url` the URL
-  if (value != NULL) json_decref(value);
 
   json_t *response = json_object();
   json_object_set_new(response, "streaming", json_string("started"));
@@ -586,6 +596,9 @@ static plugin_rtmp_session *session_from_handle(janus_plugin_session *handle) {
 
 // Validates it's RTMP(S) URL.
 static gboolean is_valid_url(const char *url) {
+  if (!url)
+    return 0;
+
   return g_regex_match_simple("^rtmps?://.+", url, 0, 0);
 }
 
@@ -593,16 +606,27 @@ static gboolean is_valid_url(const char *url) {
 // Pipeline
 // ------------------------------------------------------------------------------------------------
 
-static GstElement *create_pipeline(const char *url, int audio_port, int video_port) {
+static GstElement *create_pipeline(const char *url, int audio_port, int video_port, gboolean dummy_audio) {
   GstElement *pipeline;
+  gchar *pipeline_def = NULL;
 
-  gchar *pipeline_def = g_strdup_printf(
-    "rtpbin name=rtpbin "
-    "udpsrc address=localhost port=%d caps=\"application/x-rtp, media=audio, encoding-name=OPUS, clock-rate=48000\" ! rtpbin.recv_rtp_sink_1 "
-    "udpsrc address=localhost port=%d caps=\"application/x-rtp, media=video, encoding-name=H264, clock-rate=90000\" ! rtpbin.recv_rtp_sink_0 "
-    "rtpbin. ! rtph264depay ! flvmux streamable=true name=mux ! rtmpsink location=\"%s\" "
-    "rtpbin. ! rtpopusdepay ! queue ! opusdec ! audioconvert ! audioresample ! voaacenc bitrate=128000 ! aacparse ! mux.",
-    audio_port, video_port, url);
+  if (dummy_audio) {
+    pipeline_def = g_strdup_printf(
+      "rtpbin name=rtpbin "
+      "udpsrc address=127.0.0.1 port=%d caps=\"application/x-rtp, media=audio, encoding-name=OPUS, clock-rate=48000\" ! rtpbin.recv_rtp_sink_1 "
+      "udpsrc address=127.0.0.1 port=%d caps=\"application/x-rtp, media=video, encoding-name=H264, clock-rate=90000\" ! rtpbin.recv_rtp_sink_0 "
+      "rtpbin. ! rtph264depay ! flvmux streamable=true name=mux ! rtmpsink location=\"%s\" "
+      "audiotestsrc wave=silence ! voaacenc ! aacparse ! mux.",
+      audio_port, video_port, url);
+  } else {
+    pipeline_def = g_strdup_printf(
+        "rtpbin name=rtpbin "
+        "udpsrc address=127.0.0.1 port=%d caps=\"application/x-rtp, media=audio, encoding-name=OPUS, clock-rate=48000\" ! rtpbin.recv_rtp_sink_1 "
+        "udpsrc address=127.0.0.1 port=%d caps=\"application/x-rtp, media=video, encoding-name=H264, clock-rate=90000\" ! rtpbin.recv_rtp_sink_0 "
+        "rtpbin. ! rtph264depay ! flvmux streamable=true name=mux ! rtmpsink location=\"%s\" "
+        "rtpbin. ! rtpopusdepay ! queue ! opusdec ! audioconvert ! audioresample ! voaacenc bitrate=128000 ! aacparse ! mux.",
+        audio_port, video_port, url);
+  }
 
   JANUS_LOG(LOG_INFO, "Pipeline definition: %s\n", pipeline_def);
 
@@ -614,8 +638,8 @@ static GstElement *create_pipeline(const char *url, int audio_port, int video_po
 }
 
 
-static GstElement* start_pipeline(const char* url, int audio_port, int video_port) {
-  GstElement *pipeline = create_pipeline(url, audio_port, video_port);
+static GstElement* start_pipeline(const char* url, int audio_port, int video_port, gboolean dummy_audio) {
+  GstElement *pipeline = create_pipeline(url, audio_port, video_port, dummy_audio);
 
   if (!pipeline) {
     JANUS_LOG(LOG_ERR, "Could not create the pipeline");
