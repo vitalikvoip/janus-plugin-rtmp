@@ -38,44 +38,45 @@
 #define RTP_RANGE_MAX_DEFAULT 49999
 
 /* Plugin methods */
-janus_plugin *create(void);
-int plugin_rtmp_init(janus_callbacks *callback, const char *config_path);
-void plugin_rtmp_destroy(void);
-int plugin_rtmp_get_api_compatibility(void);
-int plugin_rtmp_get_version(void);
-const char *plugin_rtmp_get_version_string(void);
-const char *plugin_rtmp_get_description(void);
-const char *plugin_rtmp_get_name(void);
-const char *plugin_rtmp_get_author(void);
-const char *plugin_rtmp_get_package(void);
-void plugin_rtmp_create_session(janus_plugin_session *handle, int *error);
+janus_plugin *  create(void);
+int             plugin_rtmp_init(janus_callbacks *callback, const char *config_path);
+void            plugin_rtmp_destroy(void);
+int             plugin_rtmp_get_api_compatibility(void);
+int             plugin_rtmp_get_version(void);
+const char *    plugin_rtmp_get_version_string(void);
+const char *    plugin_rtmp_get_description(void);
+const char *    plugin_rtmp_get_name(void);
+const char *    plugin_rtmp_get_author(void);
+const char *    plugin_rtmp_get_package(void);
+
+void            plugin_rtmp_create_session(janus_plugin_session *handle, int *error);
 struct janus_plugin_result *plugin_rtmp_handle_message(janus_plugin_session *handle, char *transaction, json_t *message, json_t *jsep);
-void plugin_rtmp_setup_media(janus_plugin_session *handle);
-void plugin_rtmp_hangup_media(janus_plugin_session *handle);
-void plugin_rtmp_destroy_session(janus_plugin_session *handle, int *error);
-json_t *plugin_rtmp_query_session(janus_plugin_session *handle);
+void            plugin_rtmp_setup_media(janus_plugin_session *handle);
+void            plugin_rtmp_hangup_media(janus_plugin_session *handle);
+void            plugin_rtmp_destroy_session(janus_plugin_session *handle, int *error);
+json_t *        plugin_rtmp_query_session(janus_plugin_session *handle);
 
 
 
 static janus_plugin janus_rtmp_plugin =
   JANUS_PLUGIN_INIT (
-    .init = plugin_rtmp_init,
-    .destroy = plugin_rtmp_destroy,
+    .init                  = plugin_rtmp_init,
+    .destroy               = plugin_rtmp_destroy,
 
     .get_api_compatibility = plugin_rtmp_get_api_compatibility,
-    .get_version = plugin_rtmp_get_version,
-    .get_version_string = plugin_rtmp_get_version_string,
-    .get_description = plugin_rtmp_get_description,
-    .get_name = plugin_rtmp_get_name,
-    .get_author = plugin_rtmp_get_author,
-    .get_package = plugin_rtmp_get_package,
+    .get_version           = plugin_rtmp_get_version,
+    .get_version_string    = plugin_rtmp_get_version_string,
+    .get_description       = plugin_rtmp_get_description,
+    .get_name              = plugin_rtmp_get_name,
+    .get_author            = plugin_rtmp_get_author,
+    .get_package           = plugin_rtmp_get_package,
 
-    .create_session = plugin_rtmp_create_session,
-    .handle_message = plugin_rtmp_handle_message,
-    .setup_media = plugin_rtmp_setup_media,
-    .hangup_media = plugin_rtmp_hangup_media,
-    .destroy_session = plugin_rtmp_destroy_session,
-    .query_session = plugin_rtmp_query_session,
+    .create_session        = plugin_rtmp_create_session,
+    .handle_message        = plugin_rtmp_handle_message,
+    .setup_media           = plugin_rtmp_setup_media,
+    .hangup_media          = plugin_rtmp_hangup_media,
+    .destroy_session       = plugin_rtmp_destroy_session,
+    .query_session         = plugin_rtmp_query_session,
   );
 
 static volatile gint initialized = 0, stopping = 0;
@@ -85,10 +86,11 @@ static uint16_t rtp_range_min  = RTP_RANGE_MIN_DEFAULT;
 static uint16_t rtp_range_max  = RTP_RANGE_MAX_DEFAULT;
 
 #define RTP_RANGE_SIZE rtp_range_max - rtp_range_min + 1 /* inclusive range */
+#define RTP_MAP_INDEX(port) ((rtp_range_min) - (port))
 
 /* Plugin creator */
 janus_plugin *create(void) {
-  JANUS_LOG(LOG_VERB, "%s created!\n", PLUGIN_RTMP_NAME);
+  JANUS_LOG(LOG_INFO, "%s created!\n", PLUGIN_RTMP_PACKAGE);
   return &janus_rtmp_plugin;
 }
 
@@ -105,14 +107,17 @@ static struct janus_json_parameter plugin_rtmp_start_live[] = {
 typedef struct plugin_rtmp_session {
   janus_plugin_session *handle;
 
-  gboolean started;
-  GstElement *pipeline;
-  GstBus *bus;
+  gboolean     started;
+  GstElement  *pipeline;
+  GstBus      *bus;
 
   uint16_t audio_port;
   uint16_t video_port;
 
-  janus_mutex mutex;
+  volatile gint destroyed;
+
+  janus_mutex    mutex;
+  janus_refcount ref;
 } plugin_rtmp_session;
 
 typedef struct plugin_rtmp_port_mapping {
@@ -124,7 +129,7 @@ typedef struct plugin_rtmp_port_mapping {
 
 static GArray      *ports;
 static GHashTable  *sessions;
-static janus_mutex sessions_mutex = JANUS_MUTEX_INITIALIZER;
+static janus_mutex  sessions_mutex = JANUS_MUTEX_INITIALIZER;
 
 
 /* Error codes */
@@ -133,16 +138,15 @@ static janus_mutex sessions_mutex = JANUS_MUTEX_INITIALIZER;
 #define ERROR_MISSING_ELEMENT   413
 #define ERROR_UNKNOWN_ERROR     499
 
-
 /* Internal functions forward declaration. */
-static void stop_session_pipeline(plugin_rtmp_session *session);
-static gboolean bus_callback(GstBus * bus, GstMessage * message, gpointer data);
+static GstElement *         start_session_pipeline(const char* url, int audio_port, int video_port, gboolean dummy_audio);
+static void                 stop_session_pipeline(plugin_rtmp_session *session);
+static gboolean             bus_callback(GstBus * bus, GstMessage * message, gpointer data);
 static plugin_rtmp_session *session_from_handle(janus_plugin_session *handle);
-static gboolean is_valid_url(const char *url);
-static GstElement *start_pipeline(const char* url, int audio_port, int video_port, gboolean dummy_audio);
-static uint16_t get_free_port(void);
-static void set_port_mapping(plugin_rtmp_session *session, uint16_t aport, uint16_t vport);
-static void clear_port_mapping(plugin_rtmp_session *session);
+static gboolean             is_valid_url(const char *url);
+static uint16_t             get_free_port(void);
+static void                 set_port_mapping(plugin_rtmp_session *session, uint16_t aport, uint16_t vport);
+static void                 clear_port_mapping(plugin_rtmp_session *session);
 
 /* Message handlers. */
 static janus_plugin_result *handle_message(plugin_rtmp_session *session, json_t *root);
@@ -150,21 +154,40 @@ static janus_plugin_result *handle_message_start(plugin_rtmp_session *session, j
 static janus_plugin_result *handle_message_stop(plugin_rtmp_session *session, json_t *root);
 
 
+static void janus_rtmp_session_free(const janus_refcount *ref) {
+	plugin_rtmp_session *session = janus_refcount_containerof(ref, plugin_rtmp_session, ref);
+
+	JANUS_LOG(LOG_INFO, "[%s] RTMP session %p free called\n",  PLUGIN_RTMP_PACKAGE, session);
+
+	janus_mutex_destroy(&session->mutex);
+	janus_refcount_decrease(&session->handle->ref); //??
+
+	/* This session can be destroyed, free all the resources */
+	g_free(session);
+}
+
+static void janus_rtmp_session_destroy(plugin_rtmp_session *session) {
+	if(session && g_atomic_int_compare_and_exchange(&session->destroyed, 0, 1))
+		janus_refcount_decrease(&session->ref);
+}
+
 // ------------------------------------------------------------------------------------------------
 // Plugin implementation
 // ------------------------------------------------------------------------------------------------
 
 int plugin_rtmp_init(janus_callbacks *callback, const char *config_path) {
-	JANUS_LOG(LOG_INFO, "%s initialized!\n", PLUGIN_RTMP_NAME);
-	sessions = g_hash_table_new(NULL, NULL);
+
+	JANUS_LOG(LOG_INFO, "[%s] initializing\n", PLUGIN_RTMP_PACKAGE);
+
+	sessions = g_hash_table_new_full(NULL, NULL, NULL, (GDestroyNotify)janus_rtmp_session_destroy);
 	if (!sessions) {
-		JANUS_LOG(LOG_ERR, "Failed to allocate sessions table\n");
+		JANUS_LOG(LOG_ERR, "[%s] Failed to allocate sessions table\n",  PLUGIN_RTMP_PACKAGE);
 		return -1;
 	}
 
 	ports = g_array_new(FALSE, TRUE, sizeof(plugin_rtmp_port_mapping));
 	if (!ports) {
-		JANUS_LOG(LOG_ERR, "Failed to allocate ports table\n");
+		JANUS_LOG(LOG_ERR, "[%s] Failed to allocate ports table\n",  PLUGIN_RTMP_PACKAGE);
 		return -1;
 	}
 
@@ -172,14 +195,14 @@ int plugin_rtmp_init(janus_callbacks *callback, const char *config_path) {
 	if (config_path != NULL) {
 		char filename[BUFSIZ];
 		g_snprintf(filename, BUFSIZ, "%s/%s.jcfg", config_path, PLUGIN_RTMP_PACKAGE);
-		JANUS_LOG(LOG_VERB, "Configuration file: %s\n", filename);
+		JANUS_LOG(LOG_VERB, "[%s] Configuration file: %s\n", PLUGIN_RTMP_PACKAGE, filename);
 
 		janus_config *config = janus_config_parse(filename);
 		if (config == NULL) {
-			JANUS_LOG(LOG_WARN, "Couldn't find .jcfg configuration file (%s), trying .cfg\n", PLUGIN_RTMP_PACKAGE);
+			JANUS_LOG(LOG_WARN, "[%s] Couldn't find .jcfg configuration file (%s), trying .cfg\n", PLUGIN_RTMP_PACKAGE);
 			g_snprintf(filename, BUFSIZ, "%s/%s.cfg", config_path, PLUGIN_RTMP_PACKAGE);
 
-			JANUS_LOG(LOG_VERB, "Configuration file: %s\n", filename);
+			JANUS_LOG(LOG_VERB, "[%s] Configuration file: %s\n", PLUGIN_RTMP_PACKAGE, filename);
 			config = janus_config_parse(filename);
 		}
 
@@ -197,10 +220,10 @@ int plugin_rtmp_init(janus_callbacks *callback, const char *config_path) {
 					maxport++;
 
 					if (janus_string_to_uint16(item->value, &rtp_range_min) < 0)
-						JANUS_LOG(LOG_WARN, "Invalid RTP min port value: %s (assuming 0)\n", item->value);
+						JANUS_LOG(LOG_WARN, "[%s] Invalid RTP min port value: %s (assuming 0)\n", PLUGIN_RTMP_PACKAGE, item->value);
 
 					if (janus_string_to_uint16(maxport, &rtp_range_max) < 0)
-						JANUS_LOG(LOG_WARN, "Invalid RTP max port value: %s (assuming 0)\n", maxport);
+						JANUS_LOG(LOG_WARN, "[%s] Invalid RTP max port value: %s (assuming 0)\n", PLUGIN_RTMP_PACKAGE, maxport);
 
 					maxport--;
 					*maxport = '-';
@@ -229,30 +252,37 @@ int plugin_rtmp_init(janus_callbacks *callback, const char *config_path) {
 						g_array_append_val(ports, template);
 					}
 
-					JANUS_LOG(LOG_VERB, "Ports mapping array size: %u\n", ports->len);
+					JANUS_LOG(LOG_VERB, "[%s]: Ports mapping array size: %u\n", PLUGIN_RTMP_PACKAGE, ports->len);
 				}
 
-				JANUS_LOG(LOG_VERB, "Gstreamer RTMP port range: %u -- %u\n", rtp_range_min, rtp_range_max);
+				JANUS_LOG(LOG_VERB, "[%s] Gstreamer RTMP port range: %u -- %u\n",  PLUGIN_RTMP_PACKAGE, rtp_range_min, rtp_range_max);
 			}
 
 			janus_config_destroy(config);
 			config = NULL;
 		}
 	} else {
-		JANUS_LOG(LOG_WARN, "No config_path provided\n");
+		JANUS_LOG(LOG_WARN, "[%s] No config_path provided\n",  PLUGIN_RTMP_PACKAGE);
 	}
 
 	g_atomic_int_set(&initialized, 1);
 	gst_init(NULL, NULL);
 
+	JANUS_LOG(LOG_INFO, "[%s] initializing done!\n", PLUGIN_RTMP_PACKAGE);
+
 	return 0;
 }
 
 void plugin_rtmp_destroy(void) {
-  JANUS_LOG(LOG_INFO, "%s destroyed!\n", PLUGIN_RTMP_NAME);
-  g_hash_table_destroy(sessions);
+	if(!g_atomic_int_get(&initialized))
+		return;
 
-  gst_deinit();
+	g_atomic_int_set(&stopping, 1);
+	g_hash_table_destroy(sessions);
+	gst_deinit();
+	g_atomic_int_set(&initialized, 0);
+	g_atomic_int_set(&stopping, 0);
+	JANUS_LOG(LOG_INFO, "[%s] destroyed!\n", PLUGIN_RTMP_PACKAGE);
 }
 
 int plugin_rtmp_get_api_compatibility(void) {
@@ -288,6 +318,9 @@ static plugin_rtmp_session *plugin_rtmp_lookup_session(janus_plugin_session *han
   if (g_hash_table_contains(sessions, handle)) {
     session = (plugin_rtmp_session *)handle->plugin_handle;
   }
+
+  JANUS_LOG(LOG_INFO, "[%s] lookup session: handle {%p} session {%p}\n", PLUGIN_RTMP_PACKAGE, handle, session);
+
   return session;
 }
 
@@ -297,15 +330,28 @@ void plugin_rtmp_create_session(janus_plugin_session *handle, int *error) {
     return;
   }
 
+  JANUS_LOG(LOG_INFO, "[%s] Session create\n", PLUGIN_RTMP_PACKAGE);
+
   plugin_rtmp_session *session = g_malloc0(sizeof(plugin_rtmp_session));
-  session->handle = handle;
-  session->started = FALSE;
-  session->pipeline = NULL;
+  if (!session) {
+    JANUS_LOG(LOG_ERR, "[%s] Failed to allocate session\n", PLUGIN_RTMP_PACKAGE);
+    *error = -1;
+    return;
+  }
+
+  session->handle    = handle;
+  session->started   = FALSE;
+  session->pipeline  = NULL;
+  session->destroyed = 0;
+  janus_mutex_init(&session->mutex);
   handle->plugin_handle = session;
+  janus_refcount_init(&session->ref, janus_rtmp_session_free);
 
   janus_mutex_lock(&sessions_mutex);
   g_hash_table_insert(sessions, handle, session);
   janus_mutex_unlock(&sessions_mutex);
+
+  JANUS_LOG(LOG_INFO, "[%s] : new session {%p} for handle {%p}\n", PLUGIN_RTMP_PACKAGE, session, handle);
 
   return;
 }
@@ -316,14 +362,16 @@ void plugin_rtmp_destroy_session(janus_plugin_session *handle, int *error) {
     return;
   }
 
+  JANUS_LOG(LOG_INFO, "[%s] destroy session for handle {%p}\n", PLUGIN_RTMP_PACKAGE, handle);
+
   janus_mutex_lock(&sessions_mutex);
 
   plugin_rtmp_session *session = plugin_rtmp_lookup_session(handle);
   if (!session) {
-    JANUS_LOG(LOG_ERR, "No Live session associated with this handle...\n");
+    JANUS_LOG(LOG_ERR, "[%s] No Live session associated with this handle {%p}\n", PLUGIN_RTMP_PACKAGE, handle);
     *error = -2;
   } else {
-    JANUS_LOG(LOG_VERB, "Removing Live session...\n");
+    JANUS_LOG(LOG_VERB, "[%s] Removing Live session {%p}\n", PLUGIN_RTMP_PACKAGE, session);
     stop_session_pipeline(session);
     g_hash_table_remove(sessions, handle);
   }
@@ -333,38 +381,54 @@ void plugin_rtmp_destroy_session(janus_plugin_session *handle, int *error) {
 }
 
 json_t *plugin_rtmp_query_session(janus_plugin_session *handle) {
-  json_t *result;
+	json_t *result = NULL;
 
-  if (!g_atomic_int_get(&stopping) && g_atomic_int_get(&initialized) && session_from_handle(handle) != NULL) {
-    result = json_object();
-  }
+	JANUS_LOG(LOG_INFO, "[%s]: query_session for handle {%p}\n", PLUGIN_RTMP_PACKAGE, handle);
 
-  return result;
+	if (!g_atomic_int_get(&stopping) && g_atomic_int_get(&initialized)) {
+		janus_mutex_lock(&sessions_mutex);
+		plugin_rtmp_session *session = plugin_rtmp_lookup_session(handle);
+		if (session)
+			result = json_object();
+		janus_mutex_unlock(&sessions_mutex);
+	}
+
+	return result;
 }
 
 struct janus_plugin_result *plugin_rtmp_handle_message(janus_plugin_session *handle, char *transaction, json_t *message, json_t *jsep) {
-  janus_plugin_result *result;
+	janus_plugin_result *result;
 
-  // Check we aren't stopping and initialized
-  if (g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized)) {
-    result = janus_plugin_result_new(JANUS_PLUGIN_ERROR, g_atomic_int_get(&stopping) ? "Shutting down" : "Plugin not initialized", NULL);
-  } else {
-    plugin_rtmp_session *session = session_from_handle(handle);
+	JANUS_LOG(LOG_INFO, "%s handle {%p} got a message\n", PLUGIN_RTMP_PACKAGE, handle);
 
-    if (session) {
-      result = handle_message(session, message);
-    } else {
-      JANUS_LOG(LOG_ERR, "No session associated with this handle...\n");
-      result = janus_plugin_result_new(JANUS_PLUGIN_ERROR, "No session associated with this handle", NULL);
-    }
-  }
+	// Check we aren't stopping and initialized
+	if (g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized)) {
+		result = janus_plugin_result_new(JANUS_PLUGIN_ERROR, g_atomic_int_get(&stopping) ? "Shutting down" : "Plugin not initialized", NULL);
+	} else {
+		plugin_rtmp_session *session = NULL;
 
-  // Release resources
-  if (message != NULL) json_decref(message);
-  if (jsep != NULL) json_decref(jsep);
-  g_free(transaction);
+		janus_mutex_lock(&sessions_mutex);
+		session = plugin_rtmp_lookup_session(handle);
+		if (session)
+			janus_refcount_increase(&session->ref);
+		janus_mutex_unlock(&sessions_mutex);
 
-  return result;
+
+		if (session) {
+			result = handle_message(session, message);
+			janus_refcount_decrease(&session->ref);
+		} else {
+			JANUS_LOG(LOG_ERR, "%s No session associated with this handle...\n", PLUGIN_RTMP_PACKAGE);
+			result = janus_plugin_result_new(JANUS_PLUGIN_ERROR, "No session associated with this handle", NULL);
+		}
+	}
+
+	// Release resources
+	if (message != NULL) json_decref(message);
+	if (jsep != NULL) json_decref(jsep);
+	g_free(transaction);
+
+	return result;
 }
 
 void plugin_rtmp_setup_media(janus_plugin_session *handle) {
@@ -373,9 +437,15 @@ void plugin_rtmp_setup_media(janus_plugin_session *handle) {
 
 void plugin_rtmp_hangup_media(janus_plugin_session *handle) {
   JANUS_LOG(LOG_INFO, "[%s-%p] No WebRTC media anymore\n", PLUGIN_RTMP_PACKAGE, handle);
+
   janus_mutex_lock(&sessions_mutex);
+
   plugin_rtmp_session *session = plugin_rtmp_lookup_session(handle);
-  stop_session_pipeline(session);
+  if (session)
+	  stop_session_pipeline(session);
+  else
+	  JANUS_LOG(LOG_INFO, "[%s-%p] hangup_media() no session found for handle %p", PLUGIN_RTMP_PACKAGE, handle);
+
   janus_mutex_unlock(&sessions_mutex);
 }
 
@@ -385,6 +455,8 @@ void plugin_rtmp_hangup_media(janus_plugin_session *handle) {
 
 static janus_plugin_result *handle_message(plugin_rtmp_session *session, json_t *root) {
   janus_plugin_result *result;
+
+  JANUS_LOG(LOG_INFO, "%s handle_message for session {%p}\n", PLUGIN_RTMP_PACKAGE, session);
 
   /* Increase the reference counter for this session: we'll decrease it after we handle the message */
   if (!root) return janus_plugin_result_new(JANUS_PLUGIN_ERROR, "No message", NULL);
@@ -403,6 +475,8 @@ static janus_plugin_result *handle_message(plugin_rtmp_session *session, json_t 
   json_t *request = json_object_get(root, "request");
   const char *request_text = json_string_value(request);
 
+  JANUS_LOG(LOG_INFO, "%s session {%p} for a {%s} request\n", PLUGIN_RTMP_PACKAGE, session, request_text);
+
   if (!strcasecmp(request_text, "start")) {
     result = handle_message_start(session, root);
   } else if (!strcasecmp(request_text, "stop")) {
@@ -410,7 +484,7 @@ static janus_plugin_result *handle_message(plugin_rtmp_session *session, json_t 
   }
 
   if (!result) {
-    JANUS_LOG(LOG_VERB, "Unknown request '%s'\n", request_text);
+    JANUS_LOG(LOG_VERB, "[%s] Unknown request '%s'\n", PLUGIN_RTMP_PACKAGE, request_text);
     result = janus_plugin_result_new(JANUS_PLUGIN_ERROR, "Unknown request", NULL);
   }
 
@@ -452,14 +526,12 @@ static janus_plugin_result *handle_message_start(plugin_rtmp_session *session, j
     JANUS_LOG(LOG_INFO, "[%s] Session %p got aport: %u, vport: %u\n", PLUGIN_RTMP_PACKAGE, session, audio_port, video_port);
 
     set_port_mapping(session, audio_port, video_port);
-    session->audio_port = audio_port;
-    session->video_port = video_port;
   } else {
     janus_mutex_unlock(&session->mutex);
     return janus_plugin_result_new(JANUS_PLUGIN_ERROR, "No more ports available", NULL);
   }
 
-  GstElement *pipeline = start_pipeline(url, audio_port, video_port, dummy_audio);
+  GstElement *pipeline = start_session_pipeline(url, audio_port, video_port, dummy_audio);
 
   // Start watching the pipeline bus for events
   GstBus *bus = gst_element_get_bus(pipeline);
@@ -467,6 +539,8 @@ static janus_plugin_result *handle_message_start(plugin_rtmp_session *session, j
 
   session->pipeline = pipeline;
   session->bus = bus;
+
+  session->started = TRUE;
 
   janus_mutex_unlock(&session->mutex);
 
@@ -494,27 +568,6 @@ static janus_plugin_result *handle_message_stop(plugin_rtmp_session *session, js
   return janus_plugin_result_new(JANUS_PLUGIN_OK, NULL, response);
 }
 
-
-static void stop_session_pipeline(plugin_rtmp_session *session) {
-  janus_mutex_lock(&session->mutex);
-
-  if (session->pipeline) {
-    gst_element_send_event(session->pipeline, gst_event_new_eos());
-    gst_element_set_state(session->pipeline, GST_STATE_NULL);
-    gst_object_unref(GST_OBJECT(session->pipeline));
-    session->pipeline = NULL;
-  }
-
-  if (session->bus) {
-    gst_object_unref(GST_OBJECT(session->bus));
-    session->bus = NULL;
-  }
-
-  clear_port_mapping(session);
-
-  janus_mutex_unlock(&session->mutex);
-}
-
 /* use under the session lock */
 static uint16_t get_free_port(void)
 {
@@ -531,7 +584,7 @@ static uint16_t get_free_port(void)
 			port = next_port++;
 		}
 
-		map = &g_array_index(ports, plugin_rtmp_port_mapping, port - rtp_range_min);
+		map = &g_array_index(ports, plugin_rtmp_port_mapping, RTP_MAP_INDEX(port));
 		if (map && !map->session)
 			return port;
 		if (map && map->session)
@@ -551,15 +604,25 @@ static void set_port_mapping(plugin_rtmp_session *session, uint16_t aport, uint1
 	plugin_rtmp_port_mapping *amap = NULL;
 	plugin_rtmp_port_mapping *vmap = NULL;
 
-	amap = &g_array_index(ports, plugin_rtmp_port_mapping, aport);
+	if (!session)
+		return;
+
+	session->audio_port = aport;
+	session->video_port = vport;
+
+	amap = &g_array_index(ports, plugin_rtmp_port_mapping, RTP_MAP_INDEX(aport));
+	janus_refcount_increase(&session->ref);
 	amap->session    = session;
 	amap->audio_port = aport;
 	amap->video_port = vport;
 
-	vmap = &g_array_index(ports, plugin_rtmp_port_mapping, vport);
+
+	vmap = &g_array_index(ports, plugin_rtmp_port_mapping, RTP_MAP_INDEX(vport));
+	janus_refcount_increase(&session->ref);
 	vmap->session    = session;
 	vmap->audio_port = aport;
 	vmap->video_port = vport;
+
 }
 
 /* use under the session lock */
@@ -568,16 +631,23 @@ static void clear_port_mapping(plugin_rtmp_session *session)
 	plugin_rtmp_port_mapping *amap = NULL;
 	plugin_rtmp_port_mapping *vmap = NULL;
 
-	if (session)
-	amap = &g_array_index(ports, plugin_rtmp_port_mapping, session->audio_port);
+	if (!session)
+		return;
+
+	amap = &g_array_index(ports, plugin_rtmp_port_mapping, session->audio_port - rtp_range_min);
 	amap->session    = NULL;
 	amap->audio_port = 0;
 	amap->video_port = 0;
+	janus_refcount_decrease(&session->ref);
 
-	vmap = &g_array_index(ports, plugin_rtmp_port_mapping, session->video_port);
+	vmap = &g_array_index(ports, plugin_rtmp_port_mapping, session->video_port - rtp_range_min);
 	vmap->session    = NULL;
 	vmap->audio_port = 0;
 	vmap->video_port = 0;
+	janus_refcount_decrease(&session->ref);
+
+	session->audio_port = 0;
+	session->video_port = 0;
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -628,7 +698,7 @@ static GstElement *create_pipeline(const char *url, int audio_port, int video_po
         audio_port, video_port, url);
   }
 
-  JANUS_LOG(LOG_INFO, "Pipeline definition: %s\n", pipeline_def);
+  JANUS_LOG(LOG_INFO, "[%s] Pipeline definition: %s\n", PLUGIN_RTMP_PACKAGE, pipeline_def);
 
   pipeline = gst_parse_launch(pipeline_def, NULL);
 
@@ -638,15 +708,15 @@ static GstElement *create_pipeline(const char *url, int audio_port, int video_po
 }
 
 
-static GstElement* start_pipeline(const char* url, int audio_port, int video_port, gboolean dummy_audio) {
+static GstElement* start_session_pipeline(const char* url, int audio_port, int video_port, gboolean dummy_audio) {
   GstElement *pipeline = create_pipeline(url, audio_port, video_port, dummy_audio);
 
   if (!pipeline) {
-    JANUS_LOG(LOG_ERR, "Could not create the pipeline");
+    JANUS_LOG(LOG_ERR, "[%s] Could not create the pipeline", PLUGIN_RTMP_PACKAGE);
     return NULL;
   }
 
-  JANUS_LOG(LOG_INFO, "Pipeline started (ports audio: %d video: %d)\n", audio_port, video_port);
+  JANUS_LOG(LOG_INFO, "[%s] Pipeline started (ports audio: %d video: %d)\n",PLUGIN_RTMP_PACKAGE, audio_port, video_port);
 
   // Start playing
   gst_element_set_state(pipeline, GST_STATE_PLAYING);
@@ -661,20 +731,21 @@ static gboolean bus_callback(GstBus *bus, GstMessage *message, gpointer data) {
   switch (GST_MESSAGE_TYPE (message)) {
     case GST_MESSAGE_ERROR:
       gst_message_parse_error (message, &err, &debug);
-      g_print("Error: %s\n", err->message);
+      g_print("[%s] Error: %s\n", PLUGIN_RTMP_PACKAGE, err->message);
       g_error_free (err);
       g_free (debug);
       break;
 
     case GST_MESSAGE_EOS:
-      g_print("End of stream");
+      g_print("[%s] End of stream", PLUGIN_RTMP_PACKAGE);
       break;
 
     case GST_MESSAGE_STATE_CHANGED: {
       GstState old_state, new_state, pending;
 
       gst_message_parse_state_changed(message, &old_state, &new_state, &pending);
-      g_print("Element %s state changed from %s to %s\n", 
+      g_print("[%s] Element %s state changed from %s to %s\n",
+        PLUGIN_RTMP_PACKAGE,
         GST_OBJECT_NAME (message->src),
         gst_element_state_get_name (old_state),
         gst_element_state_get_name (new_state));
@@ -683,9 +754,38 @@ static gboolean bus_callback(GstBus *bus, GstMessage *message, gpointer data) {
 
     default:
       /* unhandled message */
-      g_print("Got %s message\n", GST_MESSAGE_TYPE_NAME (message));
+      g_print("[%s] Got %s message\n", PLUGIN_RTMP_PACKAGE, GST_MESSAGE_TYPE_NAME (message));
       break;
   }
   return TRUE;
+}
+
+static void stop_session_pipeline(plugin_rtmp_session *session) {
+  janus_mutex_lock(&session->mutex);
+
+  if (!session->started) {
+    janus_mutex_unlock(&session->mutex);
+    return;
+  }
+
+  if (session->pipeline) {
+    gst_element_send_event(session->pipeline, gst_event_new_eos());
+    gst_element_set_state(session->pipeline, GST_STATE_NULL);
+    gst_object_unref(GST_OBJECT(session->pipeline));
+    session->pipeline = NULL;
+  }
+
+  if (session->bus) {
+    gst_object_unref(GST_OBJECT(session->bus));
+    session->bus = NULL;
+  }
+
+  clear_port_mapping(session);
+
+  session->started = FALSE;
+
+  JANUS_LOG(LOG_VERB, "[%s] Gstreamer pipeline of session {%p} stopped\n", PLUGIN_RTMP_PACKAGE, session);
+
+  janus_mutex_unlock(&session->mutex);
 }
 
